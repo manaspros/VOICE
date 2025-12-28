@@ -2,6 +2,7 @@ import base64
 import json
 import asyncio
 import logging
+import re
 from datetime import datetime
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException
@@ -12,6 +13,10 @@ from config import settings
 import tempfile
 import subprocess
 import os
+import chromadb
+from redis.asyncio import Redis, ConnectionPool
+from session import RedisSessionManager
+from rag import RAGPipeline, RAGRetriever, GeminiGenerator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,8 +27,97 @@ app = FastAPI(title="Twilio Voice AI Assistant")
 # Initialize Twilio client
 twilio_client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
 
-# Store active call sessions
-active_sessions: Dict[str, dict] = {}
+# Initialize Redis connection pool
+redis_pool = ConnectionPool(
+    host=settings.redis_host,
+    port=settings.redis_port,
+    password=settings.redis_password,
+    db=settings.redis_db,
+    max_connections=100,
+    decode_responses=True
+)
+redis_client = Redis(connection_pool=redis_pool)
+
+# Initialize Redis session manager
+session_manager = RedisSessionManager(redis_client, ttl=settings.session_ttl)
+
+# Initialize Chroma and RAG pipeline (will be set in startup event)
+chroma_client = None
+rag_pipeline = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup"""
+    global chroma_client, rag_pipeline
+
+    logger.info("Starting Twilio Voice AI Assistant...")
+
+    # Test Redis connection
+    try:
+        await redis_client.ping()
+        logger.info("✓ Redis connected")
+    except Exception as e:
+        logger.error(f"✗ Redis connection failed: {e}")
+        logger.warning("Running without Redis - sessions will not persist")
+
+    # Initialize Chroma and RAG pipeline
+    try:
+        if settings.gemini_api_key and settings.gemini_api_key != "your_gemini_api_key_here":
+            chroma_client = chromadb.PersistentClient(path=settings.chroma_persist_dir)
+            retriever = RAGRetriever(chroma_client, settings.chroma_collection_name)
+            generator = GeminiGenerator(settings.gemini_api_key, settings.gemini_model)
+            rag_pipeline = RAGPipeline(retriever, generator)
+            logger.info("✓ RAG pipeline initialized")
+        else:
+            logger.warning("✗ Gemini API key not configured - RAG disabled")
+    except Exception as e:
+        logger.error(f"✗ RAG initialization failed: {e}")
+        logger.warning("Running without RAG - will use fallback responses")
+
+    logger.info("✓ Twilio Voice AI Assistant ready")
+
+
+def detect_language(text: str) -> str:
+    """
+    Detect if text is Hindi or English
+
+    Args:
+        text: Text to analyze
+
+    Returns:
+        Language code ('hi-IN' or 'en')
+    """
+    hindi_pattern = re.compile(r'[\u0900-\u097F]')
+    return "hi-IN" if hindi_pattern.search(text) else "en"
+
+
+async def download_recording_async(recording_url: str) -> bytes:
+    """
+    Download audio recording asynchronously
+
+    Args:
+        recording_url: URL of the recording
+
+    Returns:
+        Audio data as bytes
+    """
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{recording_url}.mp3",
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 200:
+                    return await response.read()
+                else:
+                    logger.warning(f"Failed to download recording: status {response.status}")
+                    return b""
+    except Exception as e:
+        logger.error(f"Error downloading recording: {e}")
+        return b""
 
 
 # class AudioBuffer:
@@ -96,8 +190,10 @@ async def root():
 @app.get("/sessions")
 async def get_sessions():
     """Get active call sessions"""
+    sessions = await session_manager.get_all_sessions()
+
     return {
-        "active_sessions": len(active_sessions),
+        "active_sessions": len(sessions),
         "sessions": {
             call_sid: {
                 "to": session.get("to"),
@@ -105,7 +201,7 @@ async def get_sessions():
                 "started_at": session.get("started_at"),
                 "message_count": len(session.get("conversation_history", []))
             }
-            for call_sid, session in active_sessions.items()
+            for call_sid, session in sessions.items()
         }
     }
 
@@ -113,10 +209,11 @@ async def get_sessions():
 @app.get("/session/{call_sid}")
 async def get_session(call_sid: str):
     """Get specific call session details"""
-    if call_sid not in active_sessions:
+    session = await session_manager.get_session(call_sid)
+    if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    return active_sessions[call_sid]
+
+    return session
 
 
 # @app.post("/voice/incoming")
@@ -221,13 +318,13 @@ async def make_call(request: Request):
         )
         
         # Store session data
-        active_sessions[call.sid] = {
+        await session_manager.create_session(call.sid, {
             "to": to_number,
             "from": from_number,
-            "conversation_history": [],
             "started_at": datetime.now().isoformat(),
+            "language": "en",  # Default language
             **session_data
-        }
+        })
         
         logger.info(f"Call initiated: {call.sid} to {to_number}")
         
@@ -258,57 +355,42 @@ async def process_speech(request: Request):
     
     logger.info(f"Speech from {call_sid}: '{speech_result}' (confidence: {confidence})")
     logger.info(f"Recording URL: {recording_url}, SID: {recording_sid}")
-    
-    response = VoiceResponse()
-    import requests
 
-    # Download and play the audio recording
+    response = VoiceResponse()
+
+    # Download recording asynchronously (non-blocking)
     if recording_url:
-        # Add .mp3 to get MP3 format (or .wav for WAV)
-        audio_response = requests.get(f"{recording_url}.mp3")
-        audio_data = audio_response.content
-        
-        # Save temporarily and play the audio
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
-            temp_audio.write(audio_data)
-            temp_audio_path = temp_audio.name
-            print(f"Saved temporary audio to {temp_audio_path}")
-        
-        try:
-            # Play audio using system player (works on most systems)
-            if os.name == 'posix':  # Linux/Mac
-                subprocess.Popen(['mpg123', temp_audio_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                # Or use: subprocess.Popen(['afplay', temp_audio_path])  # Mac only
-            elif os.name == 'nt':  # Windows
-                subprocess.Popen(['start', '', temp_audio_path], shell=True)
-        except Exception as e:
-            logger.error(f"Error playing audio: {str(e)}")
-        
-        # Now process the actual audio file for STT, saving, etc.
+        audio_data = await download_recording_async(recording_url)
+        if audio_data:
+            # Store recording metadata in session
+            await redis_client.hset(f"session:{call_sid}", "last_recording_url", recording_url)
+            logger.debug(f"Downloaded and stored recording for {call_sid}")
+
+    # Detect and store language
+    detected_lang = detect_language(speech_result)
+    await redis_client.hset(f"session:{call_sid}", "language", detected_lang)
+    logger.debug(f"Detected language for {call_sid}: {detected_lang}")
     
-    # Store conversation in session
-    if call_sid in active_sessions:
-        active_sessions[call_sid]["conversation_history"].append({
-            "role": "user",
-            "content": speech_result,
-            "timestamp": datetime.now().isoformat(),
-            "confidence": float(confidence),
-            "recording_url": recording_url,
-            "recording_sid": recording_sid
-        })
+    # Store user message in conversation history
+    await session_manager.add_message(call_sid, {
+        "role": "user",
+        "content": speech_result,
+        "timestamp": datetime.now().isoformat(),
+        "confidence": float(confidence),
+        "recording_url": recording_url,
+        "recording_sid": recording_sid
+    })
     
     # Generate AI response
     try:
         ai_response = await generate_ai_response_sync(speech_result, call_sid)
-        
+
         # Store AI response in conversation history
-        if call_sid in active_sessions:
-            active_sessions[call_sid]["conversation_history"].append({
-                "role": "assistant",
-                "content": ai_response,
-                "timestamp": datetime.now().isoformat()
-            })
+        await session_manager.add_message(call_sid, {
+            "role": "assistant",
+            "content": ai_response,
+            "timestamp": datetime.now().isoformat()
+        })
         
         # Speak the response
         response.say(
@@ -364,11 +446,11 @@ async def call_status(request: Request):
     
     # Clean up session when call ends
     if call_status in ["completed", "failed", "busy", "no-answer", "canceled"]:
-        if call_sid in active_sessions:
+        session = await session_manager.get_session(call_sid)
+        if session:
             # Log conversation history before cleanup
-            session = active_sessions[call_sid]
             logger.info(f"Call {call_sid} conversation: {len(session.get('conversation_history', []))} messages")
-            del active_sessions[call_sid]
+            await session_manager.delete_session(call_sid)
             logger.info(f"Cleaned up session for call {call_sid}")
     
     return {"status": "ok"}
@@ -521,45 +603,69 @@ async def call_status(request: Request):
 
 async def generate_ai_response_sync(user_input: str, call_sid: str) -> str:
     """
-    Generate AI response based on user input with conversation context
-    
+    Generate AI response using RAG pipeline
+
     Args:
         user_input: The user's speech input
         call_sid: Call SID to retrieve conversation history
-    
+
     Returns:
         AI-generated response text
     """
-    # Get conversation history
-    conversation_history = []
-    if call_sid in active_sessions:
-        conversation_history = active_sessions[call_sid].get("conversation_history", [])
-    
+    # Get session with conversation history
+    session = await session_manager.get_session(call_sid)
+    if not session:
+        logger.warning(f"Session not found for {call_sid}")
+        return "I apologize, I'm having trouble accessing your session. Please try again."
+
+    conversation_history = session.get('conversation_history', [])
+    language = session.get('language', 'en')
+
     # Check for goodbye/exit intents
-    goodbye_phrases = ["goodbye", "bye", "thank you", "thanks", "that's all", "nothing else"]
+    goodbye_phrases = ["goodbye", "bye", "thank you", "thanks", "that's all", "nothing else", "धन्यवाद", "अलविदा"]
     if any(phrase in user_input.lower() for phrase in goodbye_phrases):
-        return "Thank you for calling. Have a great day! Goodbye."
-    
-    # TODO: Integrate with LLM (OpenAI, Claude, etc.)
-    # For now, return contextual responses based on input
-    
+        if language == "hi-IN":
+            return "कॉल करने के लिए धन्यवाद। आपका दिन शुभ हो!"
+        else:
+            return "Thank you for calling. Have a great day!"
+
+    # Process with RAG pipeline if available
+    if rag_pipeline and settings.enable_rag:
+        try:
+            response = await rag_pipeline.process_query(
+                user_query=user_input,
+                conversation_history=conversation_history,
+                language=language,
+                n_results=settings.rag_top_k
+            )
+            return response
+        except Exception as e:
+            logger.error(f"RAG pipeline error: {e}", exc_info=True)
+            # Fall through to fallback responses
+
+    # Fallback responses if RAG is disabled or fails
     user_lower = user_input.lower()
-    
-    if "help" in user_lower:
-        return "मैं आपकी जानकारी, सवालों के जवाब या आपकी ज़रूरतों में मदद कर सकता हूँ। आप क्या जानना चाहेंगे?"
-    elif "weather" in user_lower:
-        return "मैं एक AI सहायक हूँ। मौसम की जानकारी के लिए, कृपया मौसम की वेबसाइट देखें या मौसम सेवा से पूछें।"
-    elif "time" in user_lower:
-        now = datetime.now()
-        return f"वर्तमान समय {now.strftime('%I:%M %p')} है।"
-    elif "date" in user_lower:
-        now = datetime.now()
-        return f"आज {now.strftime('%A, %B %d, %Y')} है।"
-    elif any(word in user_lower for word in ["hello", "hi", "hey"]):
-        return "नमस्ते! मैं आज आपकी कैसे मदद कर सकता हूँ?"
+
+    if language == "hi-IN":
+        if "help" in user_lower or "मदद" in user_lower:
+            return "मैं आपकी जानकारी, सवालों के जवाब या आपकी ज़रूरतों में मदद कर सकता हूँ। आप क्या जानना चाहेंगे?"
+        elif "time" in user_lower or "समय" in user_lower:
+            now = datetime.now()
+            return f"वर्तमान समय {now.strftime('%I:%M %p')} है।"
+        elif any(word in user_lower for word in ["hello", "hi", "नमस्ते"]):
+            return "नमस्ते! मैं आज आपकी कैसे मदद कर सकता हूँ?"
+        else:
+            return f"मैंने सुना: {user_input}। क्या आप कृपया अधिक विवरण दे सकते हैं?"
     else:
-        # Generic response
-        return f"मैंने सुना कि आपने कहा: {user_input}। मैं मदद के लिए यहाँ हूँ। क्या आप कृपया अधिक विवरण दे सकते हैं या कोई विशेष प्रश्न पूछ सकते हैं?"
+        if "help" in user_lower:
+            return "I can help you with information, answer questions, or assist with your needs. What would you like to know?"
+        elif "time" in user_lower:
+            now = datetime.now()
+            return f"The current time is {now.strftime('%I:%M %p')}."
+        elif any(word in user_lower for word in ["hello", "hi", "hey"]):
+            return "Hello! How can I help you today?"
+        else:
+            return f"I heard: {user_input}. Could you please provide more details or ask a specific question?"
 
 
 async def generate_tts(text: str) -> str:
@@ -606,11 +712,11 @@ async def play_audio_on_call(call_sid: str, audio_url: str):
 async def interrupt_call(call_sid: str):
     """
     Interrupt/pause any audio currently playing on a call
-    
+
     This endpoint can be called when the user starts speaking again
     """
     try:
-        if call_sid not in active_sessions:
+        if not await session_manager.session_exists(call_sid):
             raise HTTPException(status_code=404, detail="Call session not found")
         
         # Update call to stop current TwiML and listen
@@ -628,6 +734,74 @@ async def interrupt_call(call_sid: str):
     except Exception as e:
         logger.error(f"Error interrupting call: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint
+
+    Returns the health status of all system components
+    """
+    health = {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "components": {}
+    }
+
+    # Check Redis
+    try:
+        await redis_client.ping()
+        health["components"]["redis"] = {"status": "healthy", "message": "Connected"}
+    except Exception as e:
+        health["components"]["redis"] = {"status": "unhealthy", "message": str(e)}
+        health["status"] = "degraded"
+
+    # Check Chroma
+    try:
+        if chroma_client:
+            collection = chroma_client.get_collection(settings.chroma_collection_name)
+            count = collection.count()
+            health["components"]["chroma"] = {
+                "status": "healthy",
+                "message": f"Collection has {count} documents"
+            }
+        else:
+            health["components"]["chroma"] = {
+                "status": "not_initialized",
+                "message": "Chroma client not initialized"
+            }
+    except Exception as e:
+        health["components"]["chroma"] = {"status": "unhealthy", "message": str(e)}
+        health["status"] = "degraded"
+
+    # Check RAG Pipeline
+    if rag_pipeline:
+        health["components"]["rag_pipeline"] = {
+            "status": "healthy",
+            "message": "RAG pipeline initialized"
+        }
+    else:
+        health["components"]["rag_pipeline"] = {
+            "status": "disabled",
+            "message": "RAG pipeline not initialized (check Gemini API key)"
+        }
+        if health["status"] == "healthy":
+            health["status"] = "degraded"
+
+    # Check Twilio
+    try:
+        # Quick validation that client is configured
+        if twilio_client.account_sid:
+            health["components"]["twilio"] = {
+                "status": "healthy",
+                "message": "Twilio client configured"
+            }
+    except Exception as e:
+        health["components"]["twilio"] = {"status": "unhealthy", "message": str(e)}
+        health["status"] = "degraded"
+
+    return health
 
 
 if __name__ == "__main__":

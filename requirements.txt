@@ -7,3 +7,21 @@ pydantic==2.5.0
 pydantic-settings==2.1.0
 aiohttp==3.9.1
 python-multipart==0.0.6
+
+# Redis for session management
+redis==5.0.1
+
+# Chroma for vector database
+chromadb==0.4.22
+
+# Google Gemini for LLM
+google-generativeai==0.3.2
+
+# Sentence transformers for embeddings
+sentence-transformers==2.2.2
+
+# Monitoring and metrics
+prometheus-client==0.19.0
+
+# Additional async utilities
+aiofiles==23.2.1
